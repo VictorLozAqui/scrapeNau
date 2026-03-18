@@ -1,0 +1,52 @@
+[
+  {
+    "areaConhecimento": "Artes e Cultura",
+    "setor_maior": "210",
+    "setor_espec": "210"
+  },
+  {
+    "areaConhecimento": "Ci\u00eancias da Sa\u00fade e da Vida",
+    "setor_maior": "720",
+    "setor_espec": "720"
+  },
+  {
+    "areaConhecimento": "Ci\u00eancias Exatas e Tecnologias",
+    "setor_maior": "440",
+    "setor_espec": "440"
+  },
+  {
+    "areaConhecimento": "Ci\u00eancias Naturais e Ambiente",
+    "setor_maior": "420",
+    "setor_espec": "420"
+  },
+  {
+    "areaConhecimento": "Ci\u00eancias Sociais",
+    "setor_maior": "310",
+    "setor_espec": "310"
+  },
+  {
+    "areaConhecimento": "Comunica\u00e7\u00e3o e Marketing",
+    "setor_maior": "340",
+    "setor_espec": "340"
+  },
+  {
+    "areaConhecimento": "Direito",
+    "setor_maior": "380",
+    "setor_espec": "380"
+  },
+  {
+    "areaConhecimento": "Economia e Gest\u00e3o",
+    "setor_maior": "310",
+    "setor_espec": "310"
+  },
+  {
+    "areaConhecimento": "Forma\u00e7\u00e3o e Educa\u00e7\u00e3o",
+    "setor_maior": "140",
+    "setor_espec": "140"
+  },
+  {
+    "areaConhecimento": "Humanas e Pol\u00edticas",
+    "setor_maior": "310",
+    "setor_espec": "310"
+  }
+]

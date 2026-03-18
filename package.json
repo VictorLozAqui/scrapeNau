@@ -1,0 +1,19 @@
+{
+  "name": "scrapenau",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "scrape": "node scripts/scrape-nau.js",
+    "normalize": "node scripts/normalize-nau.js",
+    "automate": "node scripts/run-nau-automation.js"
+  },
+  "dependencies": {
+    "cheerio": "^1.2.0",
+    "firebase-admin": "^13.6.0",
+    "google-auth-library": "^10.5.0",
+    "he": "^1.2.0",
+    "playwright": "^1.58.2",
+    "xlsx": "^0.18.5"
+  }
+}
