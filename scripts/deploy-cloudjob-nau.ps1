@@ -12,7 +12,7 @@ param(
   [string]$AmpAutomationUrl = "",
   [string]$AmpServiceName = "",
   [string]$AmpServiceRegion = "",
-  [string]$AmpAllowedSources = "anqep,dges,iefp,nau",
+  [string]$AmpAllowedSources = "anqep,dges,iefp,nau,acpd",
   [switch]$DisableAmpTrigger
 )
 

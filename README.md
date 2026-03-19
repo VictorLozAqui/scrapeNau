@@ -5,8 +5,18 @@ Scraper da NAU com normalizacao para a base `formacao`, export em Excel, upload 
 ## Fluxo local
 
 1. `npm run scrape`
-   Recolhe a listagem completa da NAU, filtra cursos expirados e gera:
+   Recolhe a listagem completa da NAU, depois a listagem do ACPD, aplica a mesma regra de `Disponivel ate`, descarta no ACPD os cursos cujo `codigo` ja exista no output principal da NAU e gera:
    - `output/nau-links.json`
+   - `output/nau-cursos-base.json`
+   - `output/nau-cursos-base.xlsx`
+   - `output/nau-links-base-skipados.json`
+   - `output/acpd-links.json`
+   - `output/acpd-cursos-bruto.json`
+   - `output/acpd-cursos-bruto.xlsx`
+   - `output/acpd-cursos.json`
+   - `output/acpd-cursos.xlsx`
+   - `output/acpd-links-skipados.json`
+   - `output/acpd-duplicados-ignorados.json`
    - `output/nau-cursos.json`
    - `output/nau-cursos.xlsx`
    - `output/nau-areas-conhecimento.xlsx`
@@ -18,10 +28,12 @@ Scraper da NAU com normalizacao para a base `formacao`, export em Excel, upload 
 
 3. `npm run automate`
    Executa o pipeline completo:
-   - scrape
+   - scrape NAU base
+   - scrape ACPD
+   - deduplicacao do ACPD por `codigo` contra o output base da NAU
    - normalizacao
    - preenche `obs` com a data da execucao em `dd-mm-aaaa`
-   - remove docs antigos da NAU na colecao `formacao`
+   - remove docs antigos de `nau` e `acpd` na colecao `formacao`
    - envia o output final para o Firestore
    - grava relatorio na colecao `automacao_nau`
    - dispara a automacao AMP no fim
@@ -85,7 +97,11 @@ O script:
 ## Observacoes
 
 - O job grava logs em `automacao_nau` num formato alinhado com `automacao_iefp`.
+- O relatorio da automacao agora inclui um bloco `ACPD` com total de links, total bruto, total final e quantos duplicados por `codigo` foram ignorados.
 - O upload para `formacao` usa `cod` como document id.
-- Antes de escrever os docs novos, o pipeline remove docs antigos da origem `nau`, para nao deixar cursos expirados ou obsoletos na base.
+- Se um `cod` ja existir em `formacao` com outra `db_origem`, a linha nova e ignorada para evitar sobrescrever um registo de outra base.
+- Antes de escrever os docs novos, o pipeline remove docs antigos das origens `nau` e `acpd`, para nao deixar cursos expirados ou obsoletos na base.
+- O `output/nau-cursos.json` continua a ser o JSON final usado pela normalizacao, mas agora ele representa a soma de `NAU base + ACPD deduplicado`.
+- Na normalizacao, cursos da NAU saem com `db_origem=nau` e `cod=<codigo>_nau`; cursos vindos do ACPD saem com `db_origem=acpd` e `cod=<codigo>_acpd`.
 - O campo `AmpNetwork` continua sem ser preenchido aqui; ele fica para a automacao AMP disparada no fim.
-- Se passares `-AmpServiceName`, o deploy da NAU tambem atualiza `ALLOWED_SOURCES` no servico AMP para incluir `nau`.
+- Se passares `-AmpServiceName`, o deploy da NAU tambem atualiza `ALLOWED_SOURCES` no servico AMP para incluir `nau` e `acpd`.

@@ -15,8 +15,10 @@ const __dirname = path.dirname(__filename);
 const ROOT_DIR = path.resolve(__dirname, "..");
 const OUTPUT_DIR = path.join(ROOT_DIR, "output");
 
-const DEFAULT_LISTING_URL =
+const DEFAULT_NAU_LISTING_URL =
   "https://www.nau.edu.pt/pt/cursos/?limit=21&offset=0";
+const DEFAULT_ACPD_LISTING_URL =
+  "https://academiaportugaldigital.pt/cursos?areaId=&competenceLevelId=&duration=&language=&partner=&isRecommended=&textSearch=";
 const FIRECRAWL_COMMAND =
   process.platform === "win32" ? "firecrawl.cmd" : "firecrawl";
 const FIRECRAWL_MAX_BUFFER = 50 * 1024 * 1024;
@@ -25,7 +27,6 @@ const TIME_ZONE = process.env.TZ || "Europe/Lisbon";
 const FORCE_DIRECT_FETCH = ["1", "true", "yes"].includes(
   (process.env.NAU_DIRECT_FETCH || "").trim().toLowerCase(),
 );
-let firecrawlUnavailable = FORCE_DIRECT_FETCH;
 const COURSE_HEADERS = [
   "link",
   "titulo",
@@ -38,15 +39,35 @@ const COURSE_HEADERS = [
 const AREA_HEADERS = ["areaConhecimento"];
 const NON_AREA_BADGES = new Set([
   "Avançado",
+  "AvanÃ§ado",
   "Disponível em edX.org",
+  "DisponÃ­vel em edX.org",
   "Especialista dos Conteúdos",
+  "Especialista dos ConteÃºdos",
   "Intermédio",
+  "IntermÃ©dio",
   "Portugal Digital",
   "Principiante",
 ]);
+const SOURCE_NAU = "nau";
+const SOURCE_ACPD = "acpd";
 
-function getListingUrl() {
-  return process.argv[2] || DEFAULT_LISTING_URL;
+let firecrawlUnavailable = FORCE_DIRECT_FETCH;
+
+function getNauListingUrl() {
+  return process.argv[2] || DEFAULT_NAU_LISTING_URL;
+}
+
+function getAcpdListingUrl() {
+  const envUrl = String(process.env.ACPD_LISTING_URL || "").trim();
+  return envUrl || DEFAULT_ACPD_LISTING_URL;
+}
+
+function getAcpdSearchUrl(listingUrl) {
+  const url = new URL(listingUrl);
+  const searchUrl = new URL("/cursos-pesquisa", url.origin);
+  searchUrl.search = url.search;
+  return searchUrl.toString();
 }
 
 function getTodayIsoInTimeZone(timeZone) {
@@ -85,13 +106,21 @@ function ptDateToIso(ptDate) {
 }
 
 function normalizeText(value) {
-  const normalized = value.replace(/\s+/g, " ").trim();
+  const normalized = String(value || "").replace(/\s+/g, " ").trim();
 
-  if (/[ÃÂâ]/.test(normalized)) {
+  if (/[ÃƒÃ‚Ã¢]/.test(normalized)) {
     return Buffer.from(normalized, "latin1").toString("utf8");
   }
 
   return normalized;
+}
+
+function normalizeComparisonText(value) {
+  return normalizeText(value).toLowerCase();
+}
+
+function normalizeCodeKey(value) {
+  return normalizeText(value).replace(/\s+/g, "").toUpperCase();
 }
 
 function extractValueAfterLabel(text, label) {
@@ -168,7 +197,7 @@ function writeCoursesWorkbook(rows, outputPath) {
   const worksheetRows = [
     COURSE_HEADERS,
     ...rows.map((row) =>
-      COURSE_HEADERS.map((header) => row[header] == null ? "" : row[header]),
+      COURSE_HEADERS.map((header) => (row[header] == null ? "" : row[header])),
     ),
   ];
   const worksheet = XLSX.utils.aoa_to_sheet(worksheetRows);
@@ -189,27 +218,49 @@ function writeAreasWorkbook(areas, outputPath) {
 }
 
 function isValidAreaBadge(value) {
-  return typeof value === "string" && value.trim() && !NON_AREA_BADGES.has(value.trim());
+  return (
+    typeof value === "string" &&
+    value.trim() &&
+    !NON_AREA_BADGES.has(value.trim())
+  );
 }
 
 function collectUniqueAreas(items) {
-  return [...new Set(
-    items
-      .flatMap((item) => item.areaConhecimentoTodas || [])
-      .filter(isValidAreaBadge),
-  )].sort((left, right) => left.localeCompare(right, "pt"));
+  return [
+    ...new Set(
+      items
+        .flatMap((item) => item.areaConhecimentoTodas || [])
+        .filter(isValidAreaBadge),
+    ),
+  ].sort((left, right) => left.localeCompare(right, "pt"));
 }
 
 function extractAreaBadges($) {
-  return [...new Set(
-    $(".category-badge__title")
-      .toArray()
-      .map((element) => normalizeText($(element).text()))
-      .filter(isValidAreaBadge),
-  )];
+  return [
+    ...new Set(
+      $(".category-badge__title")
+        .toArray()
+        .map((element) => normalizeText($(element).text()))
+        .filter(isValidAreaBadge),
+    ),
+  ];
 }
 
-async function collectCourseLinks(listingUrl) {
+function extractOnclickLocationUrl(onclick, baseUrl) {
+  const match = String(onclick || "").match(/location\.href='([^']+)'/i);
+  return match?.[1] ? new URL(match[1], baseUrl).toString() : null;
+}
+
+function extractOnclickWindowOpenUrl(onclick, baseUrl) {
+  const match = String(onclick || "").match(/window\.open\('([^']+)'/i);
+  return match?.[1] ? new URL(match[1], baseUrl).toString() : null;
+}
+
+async function writeJsonFile(filePath, payload) {
+  await writeFile(filePath, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
+}
+
+async function collectNauCourseLinks(listingUrl) {
   const browser = await chromium.launch({ headless: true });
 
   try {
@@ -223,10 +274,7 @@ async function collectCourseLinks(listingUrl) {
 
     const summaryText = await page.locator("body").innerText();
     const totalCourses = extractTotalCourses(summaryText);
-    const totalPages = Math.max(
-      1,
-      Math.ceil((totalCourses || limit) / limit),
-    );
+    const totalPages = Math.max(1, Math.ceil((totalCourses || limit) / limit));
     const links = new Set();
     const visitedPages = [];
 
@@ -236,7 +284,7 @@ async function collectCourseLinks(listingUrl) {
       pageUrl.searchParams.set("offset", String(pageIndex * limit));
 
       console.log(
-        `A recolher pagina ${pageIndex + 1}/${totalPages}: ${pageUrl.toString()}`,
+        `A recolher pagina NAU ${pageIndex + 1}/${totalPages}: ${pageUrl.toString()}`,
       );
 
       await page.goto(pageUrl.toString(), {
@@ -260,6 +308,7 @@ async function collectCourseLinks(listingUrl) {
     }
 
     return {
+      listingUrl,
       links: [...links],
       totalCourses,
       totalPages,
@@ -269,6 +318,72 @@ async function collectCourseLinks(listingUrl) {
   } finally {
     await browser.close();
   }
+}
+
+async function collectAcpdCourseLinks(listingUrl) {
+  const searchUrl = getAcpdSearchUrl(listingUrl);
+  const listingPayload = await fetchCourseHtml(searchUrl);
+  const $ = cheerio.load(listingPayload.html);
+
+  const detailLinks = [
+    ...new Set(
+      $("button")
+        .toArray()
+        .map((element) => ({
+          text: normalizeText($(element).text()),
+          onclick: $(element).attr("onclick") || "",
+        }))
+        .filter((button) => normalizeComparisonText(button.text) === "saber mais")
+        .map((button) => extractOnclickLocationUrl(button.onclick, listingUrl))
+        .filter(Boolean),
+    ),
+  ];
+
+  const details = await mapWithConcurrency(
+    detailLinks,
+    CONCURRENCY,
+    async (detailUrl, index) => {
+      console.log(
+        `[acpd ${index + 1}/${detailLinks.length}] detalhe: ${detailUrl}`,
+      );
+      const detailPayload = await fetchCourseHtml(detailUrl);
+      const $detail = cheerio.load(detailPayload.html);
+      const externalUrl = extractOnclickWindowOpenUrl(
+        $detail("button")
+          .toArray()
+          .map((element) => ({
+            text: normalizeText($detail(element).text()),
+            onclick: $detail(element).attr("onclick") || "",
+          }))
+          .find(
+            (button) =>
+              normalizeComparisonText(button.text) === "ir para o curso",
+          )?.onclick,
+        detailUrl,
+      );
+
+      return {
+        detailUrl,
+        titulo: normalizeText($detail("h1 strong").last().text()) || null,
+        externalUrl: externalUrl ? normalizeCourseUrl(externalUrl) : null,
+      };
+    },
+  );
+
+  const externalLinks = [
+    ...new Set(details.map((detail) => detail.externalUrl).filter(Boolean)),
+  ];
+  const detailsWithoutExternalLink = details.filter((detail) => !detail.externalUrl);
+
+  return {
+    listingUrl,
+    searchUrl,
+    detailLinks,
+    details,
+    detailsWithoutExternalLink,
+    links: externalLinks,
+    totalCards: detailLinks.length,
+  };
 }
 
 async function extractAvailabilityWithPlaywright(url) {
@@ -283,7 +398,7 @@ async function extractAvailabilityWithPlaywright(url) {
     await page.waitForTimeout(3000);
 
     const bodyText = await page.locator("body").innerText();
-    const match = bodyText.match(/Disponível até\s+(\d{2}\/\d{2}\/\d{4})/);
+    const match = bodyText.match(/DisponÃ­vel atÃ©\s+(\d{2}\/\d{2}\/\d{4})/);
 
     return match ? ptDateToIso(match[1]) : null;
   } finally {
@@ -353,7 +468,7 @@ async function fetchCourseHtml(url) {
   const html = await response.text();
   if (!response.ok) {
     throw new Error(
-      `Nao foi possivel obter o HTML do curso (${response.status} ${response.statusText}) para ${url}.`,
+      `Nao foi possivel obter o HTML (${response.status} ${response.statusText}) para ${url}.`,
     );
   }
 
@@ -373,7 +488,7 @@ async function runFirecrawlScrapeWithRetry(url, retries = 1) {
     } catch (error) {
       lastError = error;
       if (attempt === retries) {
-        throw error;
+        break;
       }
     }
   }
@@ -426,7 +541,7 @@ function extractPrimaryAvailability(courseRunsPayload) {
   return primaryRun.end.slice(0, 10);
 }
 
-async function parseCourseFromHtml(html, url, runDateIso) {
+async function parseCourseFromHtml(html, url, runDateIso, source) {
   const $ = cheerio.load(html);
 
   const courseRunsPayload = getCourseRunsPayload($);
@@ -436,25 +551,30 @@ async function parseCourseFromHtml(html, url, runDateIso) {
   const codeText = normalizeText($(".subheader__code").first().text());
   const code =
     codeText.match(/\.\s*(.+)$/)?.[1]?.trim() ||
-    extractValueAfterLabel(codeText, "Cód.") ||
+    extractValueAfterLabel(codeText, "CÃ³d.") ||
     codeText;
-  const duration = getCharacteristicValue($, "Duração");
+  const duration = getCharacteristicValue($, "DuraÃ§Ã£o");
   const language = getCharacteristicValue($, "Idiomas");
   const availableUntilIso =
     extractPrimaryAvailability(courseRunsPayload) ||
     (await extractAvailabilityWithPlaywright(url));
 
+  const baseItem = {
+    link: url,
+    titulo: title || null,
+    duracao: duration || null,
+    idioma: language || null,
+    areaConhecimento: primaryArea,
+    areaConhecimentoTodas: areaBadges,
+    codigo: code || null,
+    origemColeta: source,
+  };
+
   if (!availableUntilIso) {
     return {
       status: "skipped",
       item: {
-        link: url,
-        titulo: title || null,
-        duracao: duration || null,
-        idioma: language || null,
-        areaConhecimento: primaryArea,
-        areaConhecimentoTodas: areaBadges,
-        codigo: code || null,
+        ...baseItem,
         motivo: "Nao foi possivel validar o campo Disponivel ate.",
       },
     };
@@ -464,13 +584,7 @@ async function parseCourseFromHtml(html, url, runDateIso) {
     return {
       status: "skipped",
       item: {
-        link: url,
-        titulo: title || null,
-        duracao: duration || null,
-        idioma: language || null,
-        areaConhecimento: primaryArea,
-        areaConhecimentoTodas: areaBadges,
-        codigo: code || null,
+        ...baseItem,
         disponivelAte: isoDateToPt(availableUntilIso),
         motivo: "Curso expirado para a data de execucao.",
       },
@@ -480,13 +594,7 @@ async function parseCourseFromHtml(html, url, runDateIso) {
   return {
     status: "included",
     item: {
-      link: url,
-      titulo: title || null,
-      duracao: duration || null,
-      idioma: language || null,
-      areaConhecimento: primaryArea,
-      areaConhecimentoTodas: areaBadges,
-      codigo: code || null,
+      ...baseItem,
       disponivelAte: isoDateToPt(availableUntilIso),
     },
   };
@@ -518,83 +626,337 @@ async function mapWithConcurrency(items, limit, mapper) {
   return results;
 }
 
+async function scrapeCourseUrls(links, runDateIso, source) {
+  return mapWithConcurrency(links, CONCURRENCY, async (url, index) => {
+    console.log(
+      `[${source} ${index + 1}/${links.length}] scrape curso: ${url}`,
+    );
+    const payload = await runFirecrawlScrapeWithRetry(url, 1);
+    return parseCourseFromHtml(payload.html, url, runDateIso, source);
+  });
+}
+
+function splitScrapeResults(results) {
+  return {
+    included: results
+      .filter((result) => result.status === "included")
+      .map((result) => result.item),
+    skipped: results
+      .filter((result) => result.status === "skipped")
+      .map((result) => result.item),
+  };
+}
+
+function dedupeSecondaryCoursesByCode(primaryCourses, secondaryCourses) {
+  const primaryCodeSet = new Set(
+    primaryCourses
+      .map((course) => normalizeCodeKey(course.codigo))
+      .filter(Boolean),
+  );
+  const secondaryCodeSet = new Set();
+  const kept = [];
+  const duplicatesAgainstPrimary = [];
+  const duplicatesWithinSecondary = [];
+
+  for (const course of secondaryCourses) {
+    const normalizedCode = normalizeCodeKey(course.codigo);
+
+    if (!normalizedCode) {
+      kept.push(course);
+      continue;
+    }
+
+    if (primaryCodeSet.has(normalizedCode)) {
+      duplicatesAgainstPrimary.push({
+        ...course,
+        motivo: "Codigo ja existe no output principal da NAU.",
+      });
+      continue;
+    }
+
+    if (secondaryCodeSet.has(normalizedCode)) {
+      duplicatesWithinSecondary.push({
+        ...course,
+        motivo: "Codigo duplicado dentro do proprio output ACPD.",
+      });
+      continue;
+    }
+
+    secondaryCodeSet.add(normalizedCode);
+    kept.push(course);
+  }
+
+  return {
+    kept,
+    duplicatesAgainstPrimary,
+    duplicatesWithinSecondary,
+  };
+}
+
+function buildCoursePayload({
+  fonte,
+  dataExecucao,
+  fusoHorario,
+  totalLinks,
+  totalDisponiveis,
+  totalSkipados,
+  cursos,
+  extra = {},
+}) {
+  return {
+    fonte,
+    dataExecucao,
+    fusoHorario,
+    totalLinks,
+    totalDisponiveis,
+    totalSkipados,
+    ...extra,
+    cursos,
+  };
+}
+
+function buildSkippedPayload({
+  fonte,
+  dataExecucao,
+  totalSkipados,
+  linksSkipados,
+  extra = {},
+}) {
+  return {
+    fonte,
+    dataExecucao,
+    totalSkipados,
+    ...extra,
+    linksSkipados,
+  };
+}
+
 async function main() {
-  const listingUrl = getListingUrl();
+  const nauListingUrl = getNauListingUrl();
+  const acpdListingUrl = getAcpdListingUrl();
   const runDateIso = getTodayIsoInTimeZone(TIME_ZONE);
 
   await mkdir(OUTPUT_DIR, { recursive: true });
 
-  console.log(`A recolher links com Playwright: ${listingUrl}`);
-  const listingData = await collectCourseLinks(listingUrl);
-  const { links, totalCourses, totalPages, visitedPages, limit } = listingData;
+  console.log(`A recolher links com Playwright: ${nauListingUrl}`);
+  const nauListingData = await collectNauCourseLinks(nauListingUrl);
   console.log(
-    `Links encontrados: ${links.length} em ${totalPages} pagina(s) visitada(s)`,
+    `Links NAU encontrados: ${nauListingData.links.length} em ${nauListingData.totalPages} pagina(s) visitada(s)`,
   );
 
-  const results = await mapWithConcurrency(
-    links,
-    CONCURRENCY,
-    async (url, index) => {
-      console.log(`[${index + 1}/${links.length}] Firecrawl scrape: ${url}`);
-      const payload = await runFirecrawlScrapeWithRetry(url, 1);
-      return parseCourseFromHtml(payload.html, url, runDateIso);
-    },
+  const nauResults = await scrapeCourseUrls(
+    nauListingData.links,
+    runDateIso,
+    SOURCE_NAU,
+  );
+  const nauSplit = splitScrapeResults(nauResults);
+
+  console.log(`A recolher links do ACPD: ${acpdListingUrl}`);
+  const acpdListingData = await collectAcpdCourseLinks(acpdListingUrl);
+  console.log(
+    `Links ACPD encontrados: ${acpdListingData.links.length} (cards=${acpdListingData.totalCards})`,
   );
 
-  const included = results
-    .filter((result) => result.status === "included")
-    .map((result) => result.item);
-  const skipped = results
-    .filter((result) => result.status === "skipped")
-    .map((result) => result.item);
-  const uniqueAreas = collectUniqueAreas(results.map((result) => result.item));
+  const acpdResults = await scrapeCourseUrls(
+    acpdListingData.links,
+    runDateIso,
+    SOURCE_ACPD,
+  );
+  const acpdSplitRaw = splitScrapeResults(acpdResults);
+  const acpdDeduped = dedupeSecondaryCoursesByCode(
+    nauSplit.included,
+    acpdSplitRaw.included,
+  );
 
-  const linksPath = path.join(OUTPUT_DIR, "nau-links.json");
-  const coursesJsonPath = path.join(OUTPUT_DIR, "nau-cursos.json");
-  const coursesExcelPath = path.join(OUTPUT_DIR, "nau-cursos.xlsx");
+  const acpdIncluded = acpdDeduped.kept;
+  const combinedIncluded = [...nauSplit.included, ...acpdIncluded];
+  const combinedSkipped = [...nauSplit.skipped, ...acpdSplitRaw.skipped];
+  const uniqueAreas = collectUniqueAreas(combinedIncluded);
+
+  const nauLinksPath = path.join(OUTPUT_DIR, "nau-links.json");
+  const nauCoursesBaseJsonPath = path.join(OUTPUT_DIR, "nau-cursos-base.json");
+  const nauCoursesBaseExcelPath = path.join(OUTPUT_DIR, "nau-cursos-base.xlsx");
+  const nauBaseSkippedPath = path.join(OUTPUT_DIR, "nau-links-base-skipados.json");
+  const acpdLinksPath = path.join(OUTPUT_DIR, "acpd-links.json");
+  const acpdCoursesRawJsonPath = path.join(OUTPUT_DIR, "acpd-cursos-bruto.json");
+  const acpdCoursesRawExcelPath = path.join(OUTPUT_DIR, "acpd-cursos-bruto.xlsx");
+  const acpdCoursesJsonPath = path.join(OUTPUT_DIR, "acpd-cursos.json");
+  const acpdCoursesExcelPath = path.join(OUTPUT_DIR, "acpd-cursos.xlsx");
+  const acpdSkippedPath = path.join(OUTPUT_DIR, "acpd-links-skipados.json");
+  const acpdDuplicatesPath = path.join(OUTPUT_DIR, "acpd-duplicados-ignorados.json");
+  const combinedCoursesJsonPath = path.join(OUTPUT_DIR, "nau-cursos.json");
+  const combinedCoursesExcelPath = path.join(OUTPUT_DIR, "nau-cursos.xlsx");
   const uniqueAreasExcelPath = path.join(OUTPUT_DIR, "nau-areas-conhecimento.xlsx");
   const legacyCoursesCsvPath = path.join(OUTPUT_DIR, "nau-cursos.csv");
-  const skippedPath = path.join(OUTPUT_DIR, "nau-links-skipados.json");
+  const combinedSkippedPath = path.join(OUTPUT_DIR, "nau-links-skipados.json");
 
-  await writeFile(
-    linksPath,
-    `${JSON.stringify(
-      {
-        fonte: listingUrl,
-        executadoEm: new Date().toISOString(),
-        limitePorPagina: limit,
-        totalPaginasVisitadas: totalPages,
-        totalCursosNaListagem: totalCourses,
-        totalLinks: links.length,
-        paginasVisitadas: visitedPages,
-        links,
-      },
-      null,
-      2,
-    )}\n`,
-    "utf8",
+  await writeJsonFile(nauLinksPath, {
+    fonte: nauListingUrl,
+    executadoEm: new Date().toISOString(),
+    limitePorPagina: nauListingData.limit,
+    totalPaginasVisitadas: nauListingData.totalPages,
+    totalCursosNaListagem: nauListingData.totalCourses,
+    totalLinks: nauListingData.links.length,
+    paginasVisitadas: nauListingData.visitedPages,
+    links: nauListingData.links,
+  });
+
+  await writeJsonFile(
+    nauCoursesBaseJsonPath,
+    buildCoursePayload({
+      fonte: nauListingUrl,
+      dataExecucao: runDateIso,
+      fusoHorario: TIME_ZONE,
+      totalLinks: nauListingData.links.length,
+      totalDisponiveis: nauSplit.included.length,
+      totalSkipados: nauSplit.skipped.length,
+      cursos: nauSplit.included,
+    }),
   );
 
-  await writeFile(
-    coursesJsonPath,
-    `${JSON.stringify(
-      {
-        fonte: listingUrl,
-        dataExecucao: runDateIso,
-        fusoHorario: TIME_ZONE,
-        totalLinks: links.length,
-        totalDisponiveis: included.length,
-        totalSkipados: skipped.length,
-        cursos: included,
-      },
-      null,
-      2,
-    )}\n`,
-    "utf8",
+  const savedNauCoursesBaseExcelPath = writeCoursesWorkbook(
+    nauSplit.included,
+    nauCoursesBaseExcelPath,
   );
 
-  const savedCoursesExcelPath = writeCoursesWorkbook(included, coursesExcelPath);
-  const savedUniqueAreasExcelPath = writeAreasWorkbook(uniqueAreas, uniqueAreasExcelPath);
+  await writeJsonFile(
+    nauBaseSkippedPath,
+    buildSkippedPayload({
+      fonte: nauListingUrl,
+      dataExecucao: runDateIso,
+      totalSkipados: nauSplit.skipped.length,
+      linksSkipados: nauSplit.skipped,
+    }),
+  );
+
+  await writeJsonFile(acpdLinksPath, {
+    fonte: acpdListingUrl,
+    fontePesquisa: acpdListingData.searchUrl,
+    executadoEm: new Date().toISOString(),
+    totalCards: acpdListingData.totalCards,
+    totalLinksDetalhe: acpdListingData.detailLinks.length,
+    totalLinksExternos: acpdListingData.links.length,
+    totalDetalhesSemLinkExterno: acpdListingData.detailsWithoutExternalLink.length,
+    detalhesSemLinkExterno: acpdListingData.detailsWithoutExternalLink,
+    detalhes: acpdListingData.details,
+    linksDetalhe: acpdListingData.detailLinks,
+    linksExternos: acpdListingData.links,
+  });
+
+  await writeJsonFile(
+    acpdCoursesRawJsonPath,
+    buildCoursePayload({
+      fonte: acpdListingUrl,
+      dataExecucao: runDateIso,
+      fusoHorario: TIME_ZONE,
+      totalLinks: acpdListingData.links.length,
+      totalDisponiveis: acpdSplitRaw.included.length,
+      totalSkipados: acpdSplitRaw.skipped.length,
+      cursos: acpdSplitRaw.included,
+      extra: {
+        totalLinksDetalhe: acpdListingData.detailLinks.length,
+      },
+    }),
+  );
+
+  const savedAcpdCoursesRawExcelPath = writeCoursesWorkbook(
+    acpdSplitRaw.included,
+    acpdCoursesRawExcelPath,
+  );
+
+  await writeJsonFile(
+    acpdCoursesJsonPath,
+    buildCoursePayload({
+      fonte: acpdListingUrl,
+      dataExecucao: runDateIso,
+      fusoHorario: TIME_ZONE,
+      totalLinks: acpdListingData.links.length,
+      totalDisponiveis: acpdIncluded.length,
+      totalSkipados: acpdSplitRaw.skipped.length,
+      cursos: acpdIncluded,
+      extra: {
+        totalLinksDetalhe: acpdListingData.detailLinks.length,
+        totalDisponiveisBruto: acpdSplitRaw.included.length,
+        totalDuplicadosIgnorados: acpdDeduped.duplicatesAgainstPrimary.length,
+        totalDuplicadosInternosIgnorados:
+          acpdDeduped.duplicatesWithinSecondary.length,
+      },
+    }),
+  );
+
+  const savedAcpdCoursesExcelPath = writeCoursesWorkbook(
+    acpdIncluded,
+    acpdCoursesExcelPath,
+  );
+
+  await writeJsonFile(
+    acpdSkippedPath,
+    buildSkippedPayload({
+      fonte: acpdListingUrl,
+      dataExecucao: runDateIso,
+      totalSkipados: acpdSplitRaw.skipped.length,
+      linksSkipados: acpdSplitRaw.skipped,
+      extra: {
+        totalLinks: acpdListingData.links.length,
+      },
+    }),
+  );
+
+  await writeJsonFile(acpdDuplicatesPath, {
+    fonte: acpdListingUrl,
+    dataExecucao: runDateIso,
+    totalDuplicadosIgnorados: acpdDeduped.duplicatesAgainstPrimary.length,
+    totalDuplicadosInternosIgnorados:
+      acpdDeduped.duplicatesWithinSecondary.length,
+    duplicadosIgnorados: acpdDeduped.duplicatesAgainstPrimary,
+    duplicadosInternosIgnorados: acpdDeduped.duplicatesWithinSecondary,
+  });
+
+  await writeJsonFile(
+    combinedCoursesJsonPath,
+    buildCoursePayload({
+      fonte: {
+        nau: nauListingUrl,
+        acpd: acpdListingUrl,
+      },
+      dataExecucao: runDateIso,
+      fusoHorario: TIME_ZONE,
+      totalLinks: nauListingData.links.length + acpdListingData.links.length,
+      totalDisponiveis: combinedIncluded.length,
+      totalSkipados: combinedSkipped.length,
+      cursos: combinedIncluded,
+      extra: {
+        origens: {
+          nau: {
+            totalLinks: nauListingData.links.length,
+            totalDisponiveis: nauSplit.included.length,
+            totalSkipados: nauSplit.skipped.length,
+          },
+          acpd: {
+            totalLinks: acpdListingData.links.length,
+            totalLinksDetalhe: acpdListingData.detailLinks.length,
+            totalDisponiveisBruto: acpdSplitRaw.included.length,
+            totalDisponiveis: acpdIncluded.length,
+            totalSkipados: acpdSplitRaw.skipped.length,
+            totalDuplicadosIgnorados:
+              acpdDeduped.duplicatesAgainstPrimary.length,
+            totalDuplicadosInternosIgnorados:
+              acpdDeduped.duplicatesWithinSecondary.length,
+          },
+        },
+      },
+    }),
+  );
+
+  const savedCombinedCoursesExcelPath = writeCoursesWorkbook(
+    combinedIncluded,
+    combinedCoursesExcelPath,
+  );
+  const savedUniqueAreasExcelPath = writeAreasWorkbook(
+    uniqueAreas,
+    uniqueAreasExcelPath,
+  );
+
   try {
     await unlink(legacyCoursesCsvPath);
   } catch (error) {
@@ -602,26 +964,45 @@ async function main() {
       throw error;
     }
   }
-  await writeFile(
-    skippedPath,
-    `${JSON.stringify(
-      {
-        fonte: listingUrl,
-        dataExecucao: runDateIso,
-        totalSkipados: skipped.length,
-        linksSkipados: skipped,
+
+  await writeJsonFile(
+    combinedSkippedPath,
+    buildSkippedPayload({
+      fonte: {
+        nau: nauListingUrl,
+        acpd: acpdListingUrl,
       },
-      null,
-      2,
-    )}\n`,
-    "utf8",
+      dataExecucao: runDateIso,
+      totalSkipados: combinedSkipped.length,
+      linksSkipados: combinedSkipped,
+      extra: {
+        origens: {
+          nau: {
+            totalSkipados: nauSplit.skipped.length,
+          },
+          acpd: {
+            totalSkipados: acpdSplitRaw.skipped.length,
+          },
+        },
+      },
+    }),
   );
 
-  console.log(`Concluido. Cursos disponiveis: ${included.length}`);
-  console.log(`JSON: ${coursesJsonPath}`);
-  console.log(`Excel: ${savedCoursesExcelPath}`);
+  console.log(`Concluido. Cursos NAU base: ${nauSplit.included.length}`);
+  console.log(
+    `Concluido. Cursos ACPD brutos: ${acpdSplitRaw.included.length} | duplicados ignorados: ${acpdDeduped.duplicatesAgainstPrimary.length}`,
+  );
+  console.log(`Concluido. Cursos finais combinados: ${combinedIncluded.length}`);
+  console.log(`NAU base JSON: ${nauCoursesBaseJsonPath}`);
+  console.log(`NAU base Excel: ${savedNauCoursesBaseExcelPath}`);
+  console.log(`ACPD raw JSON: ${acpdCoursesRawJsonPath}`);
+  console.log(`ACPD raw Excel: ${savedAcpdCoursesRawExcelPath}`);
+  console.log(`ACPD final JSON: ${acpdCoursesJsonPath}`);
+  console.log(`ACPD final Excel: ${savedAcpdCoursesExcelPath}`);
+  console.log(`JSON final combinado: ${combinedCoursesJsonPath}`);
+  console.log(`Excel final combinado: ${savedCombinedCoursesExcelPath}`);
   console.log(`Areas: ${savedUniqueAreasExcelPath}`);
-  console.log(`Skipados: ${skippedPath}`);
+  console.log(`Skipados finais: ${combinedSkippedPath}`);
 }
 
 main().catch((error) => {

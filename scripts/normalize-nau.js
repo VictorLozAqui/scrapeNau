@@ -20,6 +20,7 @@ const DEFAULT_TEMPLATE_HEADERS_JSON_PATH = path.join(
 const DEFAULT_AREA_MAP_JSON_PATH = path.join(DATA_DIR, "nau-area-map.json");
 const DEFAULT_OUTPUT_XLSX_PATH = path.join(OUTPUT_DIR, "formacaoNau.xlsx");
 const DEFAULT_DB_ORIGEM = "nau";
+const ACPD_DB_ORIGEM = "acpd";
 const DEFAULT_MODALIDADE = "online";
 const EXTRA_HEADERS = ["ccdr", "cim"];
 const LOCATION_INSERT_AFTER = "local_distrito";
@@ -166,13 +167,29 @@ function createEmptyRow(headers) {
   return Object.fromEntries(headers.map((header) => [header, ""]));
 }
 
+function resolveCourseDbOrigem(course, options = {}) {
+  const fallback =
+    String(options.dbOrigem || DEFAULT_DB_ORIGEM).trim() || DEFAULT_DB_ORIGEM;
+  const origemColeta = String(course.origemColeta || "").trim().toLowerCase();
+
+  if (origemColeta === ACPD_DB_ORIGEM) {
+    return ACPD_DB_ORIGEM;
+  }
+
+  if (origemColeta === DEFAULT_DB_ORIGEM) {
+    return DEFAULT_DB_ORIGEM;
+  }
+
+  return fallback;
+}
+
 function buildNormalizedRow(course, headers, areaMap, options = {}) {
   const row = createEmptyRow(headers);
   const codigo = String(course.codigo || "").trim();
   const titulo = String(course.titulo || "").trim();
   const area = String(course.areaConhecimento || "").trim();
   const areaMatch = areaMap.get(normalizeLookupKey(area));
-  const dbOrigem = String(options.dbOrigem || DEFAULT_DB_ORIGEM).trim() || DEFAULT_DB_ORIGEM;
+  const dbOrigem = resolveCourseDbOrigem(course, options);
   const modalidade =
     String(options.modalidade || DEFAULT_MODALIDADE).trim() || DEFAULT_MODALIDADE;
 

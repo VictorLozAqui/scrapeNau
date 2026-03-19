@@ -16,12 +16,15 @@ const ROOT_DIR = path.resolve(__dirname, "..");
 const OUTPUT_DIR = path.join(ROOT_DIR, "output");
 
 const SOURCE = String(process.env.NAU_DB_ORIGEM || "nau").trim().toLowerCase() || "nau";
+const ACPD_SOURCE = "acpd";
+const MANAGED_SOURCES = [...new Set([SOURCE, ACPD_SOURCE])];
 const TIME_ZONE = process.env.NAU_TIME_ZONE || process.env.TZ || "Europe/Lisbon";
 const FORMACAO_COLLECTION = process.env.FORMACAO_COLLECTION || "formacao";
 const LOGS_COLLECTION = process.env.NAU_LOGS_COLLECTION || "automacao_nau";
 const DEFAULT_NORMALIZED_OUTPUT_PATH = path.join(OUTPUT_DIR, "formacaoNau.xlsx");
 const COURSES_JSON_PATH = path.join(OUTPUT_DIR, "nau-cursos.json");
 const SKIPPED_JSON_PATH = path.join(OUTPUT_DIR, "nau-links-skipados.json");
+const ACPD_COURSES_JSON_PATH = path.join(OUTPUT_DIR, "acpd-cursos.json");
 const FIRESTORE_BATCH_SIZE = parsePositiveInt(
   process.env.NAU_FIRESTORE_BATCH_SIZE,
   400,
@@ -105,6 +108,10 @@ function normalizeFirestoreValue(value) {
   }
 
   return value;
+}
+
+function normalizeSourceValue(value) {
+  return String(value || "").trim().toLowerCase();
 }
 
 function recordEvent(events, level, message, extra = undefined) {
@@ -267,63 +274,149 @@ async function deleteRefsInBatches(db, refs) {
   return deleted;
 }
 
-async function cleanupNauDocs(db, activeCodes) {
-  const snapshot = await db
-    .collection(FORMACAO_COLLECTION)
-    .where("db_origem", "==", SOURCE)
-    .get();
+function groupActiveDocIdsBySource(rows) {
+  const activeDocIdsBySource = new Map();
 
-  const activeCodeSet = new Set(
-    activeCodes
-      .map((value) => String(value || "").trim())
-      .filter(Boolean),
-  );
-
-  const refsToDelete = [];
-  let staleDeleted = 0;
-  let duplicateDocIdDeleted = 0;
-
-  for (const doc of snapshot.docs) {
-    const data = doc.data() || {};
-    const cod = String(data.cod || "").trim();
-    const shouldKeep = activeCodeSet.has(doc.id);
-
-    if (shouldKeep) {
+  for (const row of rows) {
+    const source = normalizeSourceValue(row.db_origem || SOURCE) || SOURCE;
+    const docId = String(row.cod || "").trim();
+    if (!docId) {
       continue;
     }
 
-    refsToDelete.push(doc.ref);
+    if (!activeDocIdsBySource.has(source)) {
+      activeDocIdsBySource.set(source, new Set());
+    }
 
-    if (cod && activeCodeSet.has(cod)) {
-      duplicateDocIdDeleted += 1;
-    } else {
-      staleDeleted += 1;
+    activeDocIdsBySource.get(source).add(docId);
+  }
+
+  return activeDocIdsBySource;
+}
+
+function countRowsBySource(rows) {
+  const counts = new Map();
+
+  for (const row of rows) {
+    const source = normalizeSourceValue(row.db_origem || SOURCE) || SOURCE;
+    counts.set(source, (counts.get(source) || 0) + 1);
+  }
+
+  return counts;
+}
+
+function getLinksTotalForSource(source, metrics) {
+  if (source === ACPD_SOURCE) {
+    return Number(metrics.ACPD?.total_links || 0);
+  }
+
+  return Math.max(
+    0,
+    Number(metrics.links_total || 0) - Number(metrics.ACPD?.total_links || 0),
+  );
+}
+
+async function cleanupManagedDocs(db, rows) {
+  const activeDocIdsBySource = groupActiveDocIdsBySource(rows);
+  const refsToDelete = [];
+  let staleDeleted = 0;
+  let duplicateDocIdDeleted = 0;
+  let docsSeen = 0;
+
+  for (const source of MANAGED_SOURCES) {
+    const activeDocIds = activeDocIdsBySource.get(source) || new Set();
+    const snapshot = await db
+      .collection(FORMACAO_COLLECTION)
+      .where("db_origem", "==", source)
+      .get();
+
+    docsSeen += snapshot.size;
+
+    for (const doc of snapshot.docs) {
+      const data = doc.data() || {};
+      const cod = String(data.cod || "").trim();
+      const shouldKeep = activeDocIds.has(doc.id);
+
+      if (shouldKeep) {
+        continue;
+      }
+
+      refsToDelete.push(doc.ref);
+
+      if (cod && activeDocIds.has(cod)) {
+        duplicateDocIdDeleted += 1;
+      } else {
+        staleDeleted += 1;
+      }
     }
   }
 
   const totalDeleted = await deleteRefsInBatches(db, refsToDelete);
 
   return {
-    cleanup_docs_seen: snapshot.size,
-    cleanup_source_docs_seen: snapshot.size,
+    cleanup_docs_seen: docsSeen,
+    cleanup_source_docs_seen: docsSeen,
     cleanup_stale_deleted: staleDeleted,
     cleanup_duplicate_doc_id_deleted: duplicateDocIdDeleted,
     cleanup_total_deleted: totalDeleted,
-    cleanup_indexed_active_courses: activeCodeSet.size,
+    cleanup_indexed_active_courses: [...activeDocIdsBySource.values()].reduce(
+      (sum, ids) => sum + ids.size,
+      0,
+    ),
+    cleanup_sources: MANAGED_SOURCES,
   };
+}
+
+async function getExistingDocsById(rows, db) {
+  const collection = db.collection(FORMACAO_COLLECTION);
+  const docIds = [];
+  const seenDocIds = new Set();
+
+  for (const row of rows) {
+    const docId = String(row.cod || "").trim();
+    if (!docId || seenDocIds.has(docId)) {
+      continue;
+    }
+
+    seenDocIds.add(docId);
+    docIds.push(docId);
+  }
+
+  const existingDocs = new Map();
+
+  for (let index = 0; index < docIds.length; index += FIRESTORE_BATCH_SIZE) {
+    const slice = docIds.slice(index, index + FIRESTORE_BATCH_SIZE);
+    const refs = slice.map((docId) => collection.doc(docId));
+    const snapshots = await db.getAll(...refs);
+
+    for (const snapshot of snapshots) {
+      if (!snapshot.exists) {
+        continue;
+      }
+
+      existingDocs.set(snapshot.id, snapshot.data() || {});
+    }
+  }
+
+  return existingDocs;
 }
 
 async function writeRowsToFirestore(rows, db) {
   const collection = db.collection(FORMACAO_COLLECTION);
+  const existingDocsById = await getExistingDocsById(rows, db);
   let batch = db.batch();
   let batchCount = 0;
   let written = 0;
   let skippedInvalidId = 0;
   let skippedDuplicateDocId = 0;
+  let skippedExistingCod = 0;
   const seenDocIds = new Set();
+  const writtenBySource = {};
+  const skippedExistingCodBySource = {};
 
   for (const row of rows) {
     const docId = String(row.cod || "").trim();
+    const rowSource = normalizeSourceValue(row.db_origem || SOURCE) || SOURCE;
 
     if (!docId) {
       skippedInvalidId += 1;
@@ -336,6 +429,16 @@ async function writeRowsToFirestore(rows, db) {
     }
 
     seenDocIds.add(docId);
+    const existingDoc = existingDocsById.get(docId);
+    const existingSource = normalizeSourceValue(existingDoc?.db_origem);
+
+    if (existingDoc && existingSource && existingSource !== rowSource) {
+      skippedExistingCod += 1;
+      skippedExistingCodBySource[rowSource] =
+        (skippedExistingCodBySource[rowSource] || 0) + 1;
+      continue;
+    }
+
     const payload = {};
 
     for (const [key, value] of Object.entries(row)) {
@@ -346,6 +449,7 @@ async function writeRowsToFirestore(rows, db) {
     batch.set(collection.doc(docId), payload);
     batchCount += 1;
     written += 1;
+    writtenBySource[rowSource] = (writtenBySource[rowSource] || 0) + 1;
 
     if (batchCount >= FIRESTORE_BATCH_SIZE) {
       await batch.commit();
@@ -362,6 +466,9 @@ async function writeRowsToFirestore(rows, db) {
     written,
     skipped_invalid_id: skippedInvalidId,
     skipped_duplicate_doc_id: skippedDuplicateDocId,
+    skipped_existing_cod: skippedExistingCod,
+    skipped_existing_cod_by_source: skippedExistingCodBySource,
+    written_by_source: writtenBySource,
   };
 }
 
@@ -442,7 +549,8 @@ async function triggerAmpAutomation(source, runId, payloadExtra = undefined) {
   }
 
   const ampSource =
-    String(process.env.AMP_AUTOMATION_SOURCE || source).trim().toLowerCase() ||
+    normalizeSourceValue(source) ||
+    normalizeSourceValue(process.env.AMP_AUTOMATION_SOURCE) ||
     source;
   const audience = String(process.env.AMP_AUTOMATION_AUDIENCE || url).trim() || url;
   const timeoutSec = parsePositiveInt(
@@ -525,7 +633,7 @@ async function main() {
   let currentStage = "init";
   let status = "success";
   let errorMessage = "";
-  let ampTriggerResult = { status: "not_attempted" };
+  let ampTriggerResult = { status: "not_attempted", sources: {} };
 
   const metrics = {
     run_id: "",
@@ -540,6 +648,9 @@ async function main() {
     records_written: 0,
     records_skipped_invalid_id: 0,
     records_skipped_duplicate_doc_id: 0,
+    records_skipped_existing_cod: 0,
+    records_skipped_existing_cod_by_source: {},
+    records_written_by_source: {},
     output_xlsx_path: "",
     cleanup_docs_seen: 0,
     cleanup_source_docs_seen: 0,
@@ -549,6 +660,15 @@ async function main() {
     cleanup_indexed_active_courses: 0,
     skipped_expired: 0,
     skipped_invalid_availability: 0,
+    ACPD: {
+      total_links: 0,
+      total_links_detalhe: 0,
+      total_disponiveis_bruto: 0,
+      total_disponiveis: 0,
+      total_skipados: 0,
+      duplicados_ignorados: 0,
+      duplicados_internos_ignorados: 0,
+    },
   };
 
   try {
@@ -588,6 +708,10 @@ async function main() {
     metrics.output_xlsx_path = normalizedOutputPath;
 
     const coursesPayload = readJson(COURSES_JSON_PATH, "JSON de cursos");
+    const acpdCoursesPayload = readJson(
+      ACPD_COURSES_JSON_PATH,
+      "JSON de cursos ACPD",
+    );
     const skippedPayload = readJson(SKIPPED_JSON_PATH, "JSON de skipados");
     const normalizedRows = readWorkbookObjects(normalizedOutputPath);
 
@@ -595,6 +719,27 @@ async function main() {
     metrics.total_disponiveis = Number(coursesPayload.totalDisponiveis || 0);
     metrics.total_skipados = Number(coursesPayload.totalSkipados || 0);
     metrics.rows_final = normalizedRows.length;
+    metrics.ACPD = {
+      total_links: Number(acpdCoursesPayload.totalLinks || 0),
+      total_links_detalhe: Number(acpdCoursesPayload.totalLinksDetalhe || 0),
+      total_disponiveis_bruto: Number(
+        acpdCoursesPayload.totalDisponiveisBruto || 0,
+      ),
+      total_disponiveis: Number(acpdCoursesPayload.totalDisponiveis || 0),
+      total_skipados: Number(acpdCoursesPayload.totalSkipados || 0),
+      duplicados_ignorados: Number(
+        acpdCoursesPayload.totalDuplicadosIgnorados || 0,
+      ),
+      duplicados_internos_ignorados: Number(
+        acpdCoursesPayload.totalDuplicadosInternosIgnorados || 0,
+      ),
+    };
+    recordEvent(
+      events,
+      "INFO",
+      `ACPD stats: links=${metrics.ACPD.total_links} bruto=${metrics.ACPD.total_disponiveis_bruto} final=${metrics.ACPD.total_disponiveis} duplicados_ignorados=${metrics.ACPD.duplicados_ignorados}`,
+      metrics.ACPD,
+    );
 
     const skippedItems = Array.isArray(skippedPayload.linksSkipados)
       ? skippedPayload.linksSkipados
@@ -609,6 +754,15 @@ async function main() {
     if (normalizedRows.length !== metrics.total_disponiveis) {
       validationWarnings.push(
         `Contagem do XLSX normalizado diverge do JSON de cursos (xlsx=${normalizedRows.length} json=${metrics.total_disponiveis}).`,
+      );
+    }
+
+    if (
+      metrics.ACPD.total_disponiveis >
+      metrics.ACPD.total_disponiveis_bruto
+    ) {
+      validationWarnings.push(
+        "Contagem final do ACPD ficou maior do que a contagem bruta antes da deduplicacao.",
       );
     }
 
@@ -628,16 +782,16 @@ async function main() {
     }
 
     const dbReady = db || getDb();
-    const activeCodes = normalizedRows.map((row) => row.cod);
+    const rowsBySource = countRowsBySource(normalizedRows);
 
     currentStage = "cleanup_formacao";
     stageStart = Date.now();
     recordEvent(
       events,
       "INFO",
-      "Step 3: removing stale NAU docs from Firestore",
+      `Step 3: removing stale docs from Firestore for sources ${MANAGED_SOURCES.join(", ")}`,
     );
-    const cleanupStats = await cleanupNauDocs(dbReady, activeCodes);
+    const cleanupStats = await cleanupManagedDocs(dbReady, normalizedRows);
     stageDurations.cleanup_formacao = Number(
       ((Date.now() - stageStart) / 1000).toFixed(2),
     );
@@ -665,14 +819,24 @@ async function main() {
     metrics.records_skipped_invalid_id = writeStats.skipped_invalid_id;
     metrics.records_skipped_duplicate_doc_id =
       writeStats.skipped_duplicate_doc_id;
+    metrics.records_skipped_existing_cod = writeStats.skipped_existing_cod;
+    metrics.records_skipped_existing_cod_by_source =
+      writeStats.skipped_existing_cod_by_source;
+    metrics.records_written_by_source = writeStats.written_by_source;
     recordEvent(
       events,
       "INFO",
-      `Firestore write stats: written=${writeStats.written} skipped_invalid=${writeStats.skipped_invalid_id} skipped_duplicate=${writeStats.skipped_duplicate_doc_id}`,
+      `Firestore write stats: written=${writeStats.written} skipped_invalid=${writeStats.skipped_invalid_id} skipped_duplicate=${writeStats.skipped_duplicate_doc_id} skipped_existing_cod=${writeStats.skipped_existing_cod}`,
       writeStats,
     );
 
-    if (writeStats.written !== normalizedRows.length - writeStats.skipped_invalid_id - writeStats.skipped_duplicate_doc_id) {
+    if (
+      writeStats.written !==
+      normalizedRows.length -
+        writeStats.skipped_invalid_id -
+        writeStats.skipped_duplicate_doc_id -
+        writeStats.skipped_existing_cod
+    ) {
       validationWarnings.push(
         "Quantidade escrita no Firestore difere da contagem esperada apos filtragem de ids.",
       );
@@ -684,13 +848,32 @@ async function main() {
     ) {
       currentStage = "trigger_amp";
       stageStart = Date.now();
-      recordEvent(events, "INFO", "Step 5: triggering AMP automation");
-      ampTriggerResult = await triggerAmpAutomation(SOURCE, runId, {
-        docs_written: metrics.docs_written,
-        rows_final: metrics.rows_final,
-        captured_date: capturedDate,
-        links_total: metrics.links_total,
-      });
+      const ampSources = [...rowsBySource.keys()].filter(Boolean);
+      recordEvent(
+        events,
+        "INFO",
+        `Step 5: triggering AMP automation for sources ${ampSources.join(", ")}`,
+      );
+      const ampResults = {};
+
+      for (const ampSource of ampSources) {
+        const sourceRows = rowsBySource.get(ampSource) || 0;
+        const sourceRowsWritten = writeStats.written_by_source?.[ampSource] || 0;
+        ampResults[ampSource] = await triggerAmpAutomation(ampSource, runId, {
+          docs_written: sourceRowsWritten,
+          rows_final: sourceRows,
+          captured_date: capturedDate,
+          links_total: getLinksTotalForSource(ampSource, metrics),
+        });
+      }
+
+      const ampStatuses = Object.values(ampResults).map((result) => result.status);
+      ampTriggerResult = {
+        status: ampStatuses.every((value) => value === "success")
+          ? "success"
+          : "partial_error",
+        sources: ampResults,
+      };
       stageDurations.trigger_amp = Number(
         ((Date.now() - stageStart) / 1000).toFixed(2),
       );
@@ -704,6 +887,7 @@ async function main() {
       ampTriggerResult = {
         status: "skipped",
         reason: "TRIGGER_AMP_AFTER_RUN=false",
+        sources: {},
       };
       recordEvent(
         events,
